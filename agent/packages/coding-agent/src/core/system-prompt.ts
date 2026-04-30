@@ -39,34 +39,8 @@ function extractAcceptanceCriteria(taskText: string): string[] {
 }
 
 function extractNamedFiles(taskText: string): string[] {
-	const found = new Set<string>();
-	const push = (raw: string): void => {
-		const cleaned = raw
-			.trim()
-			.replace(/^`|`$/g, "")
-			.replace(/^[("'[\s]+/, "")
-			.replace(/[)"'\],:;.\s]+$/, "")
-			.replace(/^\.\//, "");
-		if (!cleaned) return;
-		if (!/[A-Za-z0-9]/.test(cleaned)) return;
-		if (!/\.[A-Za-z0-9]{1,8}$/.test(cleaned)) return;
-		if (cleaned.length > 220) return;
-		found.add(cleaned);
-	};
-
-	const backtickMatches = taskText.match(/`([^`]+\.[a-zA-Z0-9]{1,8})`/g) || [];
-	for (const m of backtickMatches) push(m);
-
-	const pathLike =
-		taskText.match(
-			/(?:^|[\s"'`(\[])((?:\.\.?\/|\/)?(?:[\w.-]+\/)+[\w.-]+\.[a-zA-Z0-9]{1,8})(?=$|[\s"'`)\],:;.])/g,
-		) || [];
-	for (const p of pathLike) push(p);
-
-	const bareFileNames = taskText.match(/\b[\w.-]+\.[a-zA-Z0-9]{1,8}\b/g) || [];
-	for (const b of bareFileNames) push(b);
-
-	return [...found].slice(0, 60);
+	const matches = taskText.match(/`([^`]+\.[a-zA-Z0-9]{1,6})`/g) || [];
+	return [...new Set(matches.map(f => f.replace(/`/g, '').trim()))];
 }
 
 function detectFileStyle(cwd: string, relPath: string): string | null {
@@ -118,7 +92,6 @@ function shellEscape(s: string): string {
 function buildTaskDiscoverySection(taskText: string, cwd: string): string {
 	try {
 		const keywords = new Set<string>();
-		const exactFileNames = new Set<string>();
 		const backticks = taskText.match(/`([^`]{2,80})`/g) || [];
 		for (const b of backticks) { const t = b.slice(1, -1).trim(); if (t.length >= 2 && t.length <= 80) keywords.add(t); }
 		const camel = taskText.match(/\b[A-Za-z][a-z]+(?:[A-Z][a-zA-Z0-9]*)+\b/g) || [];
@@ -140,49 +113,16 @@ function buildTaskDiscoverySection(taskText: string, cwd: string): string {
 			const inner = b.slice(1, -1).trim();
 			if (/^[\w./-]+\.[a-zA-Z0-9]{1,6}$/.test(inner) && inner.length < 200) paths.add(inner.replace(/^\.\//, ""));
 		}
-		const namedFilesFromTask = extractNamedFiles(taskText);
-		for (const named of namedFilesFromTask) {
-			const normalized = named.replace(/^\.\//, "");
-			if (normalized.includes("/")) paths.add(normalized);
-			keywords.add(normalized);
-			const parts = normalized.split("/");
-			const base = parts[parts.length - 1];
-			if (base && /\.[a-zA-Z0-9]{1,8}$/.test(base)) exactFileNames.add(base);
-		}
-		for (const p of paths) {
-			const parts = p.split("/");
-			const base = parts[parts.length - 1];
-			if (base && /\.[a-zA-Z0-9]{1,8}$/.test(base)) exactFileNames.add(base);
-		}
 		const filtered = [...keywords]
 			.filter(k => k.length >= 3 && k.length <= 80)
 			.filter(k => !/["']/.test(k))
 			.filter(k => !STOP_WORDS.has(k.toLowerCase()))
-			.slice(0, 50);
+			.slice(0, 20);
 		if (filtered.length === 0 && paths.size === 0) return "";
 
 		const fileHits = new Map<string, Set<string>>();
-		const exactFilenameHits = new Map<string, Set<string>>();
 		const includeGlobs =
 			'--include="*.ts" --include="*.tsx" --include="*.js" --include="*.jsx" --include="*.mjs" --include="*.cjs" --include="*.py" --include="*.go" --include="*.rs" --include="*.java" --include="*.kt" --include="*.scala" --include="*.dart" --include="*.rb" --include="*.cs" --include="*.cpp" --include="*.c" --include="*.h" --include="*.hpp" --include="*.vue" --include="*.svelte" --include="*.css" --include="*.scss" --include="*.html" --include="*.json" --include="*.yaml" --include="*.yml" --include="*.toml" --include="*.md"';
-		for (const fileName of exactFileNames) {
-			if (fileName.length > 140 || fileName.includes(" ")) continue;
-			try {
-				const nameResult = execSync(
-					`find . -type f -name "${shellEscape(fileName)}" -not -path "*/node_modules/*" -not -path "*/.git/*" -not -path "*/dist/*" -not -path "*/build/*" -not -path "*/.next/*" -not -path "*/target/*" | head -12`,
-					{ cwd, timeout: 2200, encoding: "utf-8", maxBuffer: 1024 * 1024 },
-				).trim();
-				if (!nameResult) continue;
-				for (const line of nameResult.split("\n")) {
-					const file = line.trim().replace(/^\.\//, "");
-					if (!file) continue;
-					if (!exactFilenameHits.has(file)) exactFilenameHits.set(file, new Set());
-					exactFilenameHits.get(file)!.add(fileName);
-					if (!fileHits.has(file)) fileHits.set(file, new Set());
-					fileHits.get(file)!.add(fileName + " (exact filename)");
-				}
-			} catch { }
-		}
 		for (const kw of filtered) {
 			try {
 				const escaped = shellEscape(kw);
@@ -244,18 +184,8 @@ function buildTaskDiscoverySection(taskText: string, cwd: string): string {
 			for (const p of literalPaths) sections.push(`- ${p}`);
 		}
 
-		const exactByName = [...exactFilenameHits.entries()].sort((a, b) => b[1].size - a[1].size).slice(0, 15);
+		const sortedFilename = [...filenameHits.entries()].sort((a, b) => b[1].size - a[1].size).slice(0, 8);
 		const shownFiles = new Set(literalPaths);
-		const exactNotShown = exactByName.filter(([file]) => !shownFiles.has(file));
-		if (exactNotShown.length > 0) {
-			sections.push("\nFILES MATCHING EXACT FILENAME (very high priority):");
-			for (const [file, kws] of exactNotShown) {
-				sections.push(`- ${file} (exact name: ${[...kws].slice(0, 5).join(", ")})`);
-				shownFiles.add(file);
-			}
-		}
-
-		const sortedFilename = [...filenameHits.entries()].sort((a, b) => b[1].size - a[1].size).slice(0, 10);
 		const newFilenameHits = sortedFilename.filter(([file]) => !shownFiles.has(file));
 		if (newFilenameHits.length > 0) {
 			sections.push("\nFILES MATCHING BY NAME (high priority — likely need edits):");
@@ -368,6 +298,28 @@ function buildTaskDiscoverySection(taskText: string, cwd: string): string {
 // Validator scores by ABSOLUTE matched changed lines (LCS over -:line / +:line markers).
 // Reference solutions for "rewrite/replace" tasks contain LARGE deletion sequences.
 // We win by also producing large deletion sequences that overlap.
+const TAU_SCORING_HEADER = `You are an expert coding assistant operating inside pi, a coding agent harness.
+Your diff is scored against a hidden reference diff for the same task.
+Coverage and correctness matter: missing required surfaces loses score.
+`;
+
+const TAU_PLAN_PHASE_BODY = `## Current phase: PLAN (discovery and planning only)
+
+- Build a complete and concrete file plan before implementation.
+- Prefer exact task strings/paths/identifiers during discovery.
+- Map each acceptance criterion to one or more specific files.
+- If the task implies cross-layer behavior, include adjacent wiring/config surfaces.
+- Stay in planning mode until coverage is complete and unambiguous.
+`;
+
+const TAU_IMPLEMENT_PHASE_BODY = `## Current phase: IMPLEMENT (execute planned changes)
+
+- Execute the frozen plan with minimal churn.
+- Match local style exactly and avoid speculative refactors.
+- Keep edits scoped to required files and required wiring only.
+- Verify each criterion has a corresponding landed edit before stopping.
+`;
+
 const TAU_SCORING_PREAMBLE_FOR_MAIN_BRANCH = `## Hard constraints
 
 - Start with a tool call immediately.
@@ -661,7 +613,7 @@ export interface BuildSystemPromptOptions {
 	contextFiles?: Array<{ path: string; content: string }>;
 	/** Pre-loaded skills. */
 	skills?: Skill[];
-	/** Optional phase hint for harness-style prompts. */
+	/** Optional phase hint for tau-style prompts. */
 	tauPhase?: "plan" | "implement";
 }
 
@@ -691,13 +643,13 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions = {}): strin
 	const skills = providedSkills ?? [];
 
 	if (customPrompt) {
-		const phasePrefix =
+		const tauPrefix =
 			tauPhase === "plan"
-				? "## Current phase: PLAN\n\n- Focus on discovery and planning quality first.\n- Avoid implementation details until plan is complete.\n\n"
+				? TAU_SCORING_HEADER + TAU_PLAN_PHASE_BODY
 				: tauPhase === "implement"
-					? "## Current phase: IMPLEMENT\n\n- Execute edits with minimal churn and strict style matching.\n- Prioritize completing mapped requirements.\n\n"
+					? TAU_SCORING_HEADER + TAU_IMPLEMENT_PHASE_BODY
 					: "";
-		let prompt = phasePrefix + TAU_SCORING_PREAMBLE_FOR_CUSTOM_BRANCH + discoverySection + customPrompt;
+		let prompt = tauPrefix + TAU_SCORING_PREAMBLE_FOR_CUSTOM_BRANCH + discoverySection + customPrompt;
 
 		if (appendSection) {
 			prompt += "\n\n# Appended Section\n\n";
