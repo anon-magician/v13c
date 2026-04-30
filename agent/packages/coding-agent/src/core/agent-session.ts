@@ -796,7 +796,8 @@ export class AgentSession {
 		this.agent.state.tools = tools;
 
 		// Rebuild base system prompt with new tool set
-		this._syncBaseSystemPrompt();
+		this._baseSystemPrompt = this._rebuildSystemPrompt(validToolNames);
+		this.agent.state.systemPrompt = this._baseSystemPrompt;
 	}
 
 	/** Whether compaction or branch summarization is currently running */
@@ -877,11 +878,6 @@ export class AgentSession {
 		return Array.from(unique);
 	}
 
-	private _syncBaseSystemPrompt(): void {
-		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
-		this.agent.state.systemPrompt = this._baseSystemPrompt;
-	}
-
 	private _rebuildSystemPrompt(toolNames: string[]): string {
 		const validToolNames = toolNames.filter((name) => this._toolRegistry.has(name));
 		const toolSnippets: Record<string, string> = {};
@@ -914,7 +910,6 @@ export class AgentSession {
 			selectedTools: validToolNames,
 			toolSnippets,
 			promptGuidelines,
-			model: this.model ? { provider: this.model.provider, id: this.model.id } : undefined,
 		});
 	}
 
@@ -1393,8 +1388,6 @@ export class AgentSession {
 		this.setThinkingLevel(thinkingLevel);
 
 		await this._emitModelSelect(model, previousModel, "set");
-
-		this._syncBaseSystemPrompt();
 	}
 
 	/**
@@ -1436,8 +1429,6 @@ export class AgentSession {
 
 		await this._emitModelSelect(next.model, currentModel, "cycle");
 
-		this._syncBaseSystemPrompt();
-
 		return { model: next.model, thinkingLevel: this.thinkingLevel, isScoped: true };
 	}
 
@@ -1462,8 +1453,6 @@ export class AgentSession {
 		this.setThinkingLevel(thinkingLevel);
 
 		await this._emitModelSelect(nextModel, currentModel, "cycle");
-
-		this._syncBaseSystemPrompt();
 
 		return { model: nextModel, thinkingLevel: this.thinkingLevel, isScoped: false };
 	}
@@ -2057,7 +2046,8 @@ export class AgentSession {
 		};
 
 		this._resourceLoader.extendResources(extensionPaths);
-		this._syncBaseSystemPrompt();
+		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
+		this.agent.state.systemPrompt = this._baseSystemPrompt;
 	}
 
 	private buildExtensionResourcePaths(entries: Array<{ path: string; extensionPath: string }>): Array<{

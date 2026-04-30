@@ -39,8 +39,34 @@ function extractAcceptanceCriteria(taskText: string): string[] {
 }
 
 function extractNamedFiles(taskText: string): string[] {
-	const matches = taskText.match(/`([^`]+\.[a-zA-Z0-9]{1,6})`/g) || [];
-	return [...new Set(matches.map(f => f.replace(/`/g, '').trim()))];
+	const found = new Set<string>();
+	const push = (raw: string): void => {
+		const cleaned = raw
+			.trim()
+			.replace(/^`|`$/g, "")
+			.replace(/^[("'[\s]+/, "")
+			.replace(/[)"'\],:;.\s]+$/, "")
+			.replace(/^\.\//, "");
+		if (!cleaned) return;
+		if (!/[A-Za-z0-9]/.test(cleaned)) return;
+		if (!/\.[A-Za-z0-9]{1,8}$/.test(cleaned)) return;
+		if (cleaned.length > 220) return;
+		found.add(cleaned);
+	};
+
+	const backtickMatches = taskText.match(/`([^`]+\.[a-zA-Z0-9]{1,8})`/g) || [];
+	for (const m of backtickMatches) push(m);
+
+	const pathLike =
+		taskText.match(
+			/(?:^|[\s"'`(\[])((?:\.\.?\/|\/)?(?:[\w.-]+\/)+[\w.-]+\.[a-zA-Z0-9]{1,8})(?=$|[\s"'`)\],:;.])/g,
+		) || [];
+	for (const p of pathLike) push(p);
+
+	const bareFileNames = taskText.match(/\b[\w.-]+\.[a-zA-Z0-9]{1,8}\b/g) || [];
+	for (const b of bareFileNames) push(b);
+
+	return [...found].slice(0, 60);
 }
 
 function detectFileStyle(cwd: string, relPath: string): string | null {
@@ -92,6 +118,7 @@ function shellEscape(s: string): string {
 function buildTaskDiscoverySection(taskText: string, cwd: string): string {
 	try {
 		const keywords = new Set<string>();
+		const exactFileNames = new Set<string>();
 		const backticks = taskText.match(/`([^`]{2,80})`/g) || [];
 		for (const b of backticks) { const t = b.slice(1, -1).trim(); if (t.length >= 2 && t.length <= 80) keywords.add(t); }
 		const camel = taskText.match(/\b[A-Za-z][a-z]+(?:[A-Z][a-zA-Z0-9]*)+\b/g) || [];
@@ -113,16 +140,49 @@ function buildTaskDiscoverySection(taskText: string, cwd: string): string {
 			const inner = b.slice(1, -1).trim();
 			if (/^[\w./-]+\.[a-zA-Z0-9]{1,6}$/.test(inner) && inner.length < 200) paths.add(inner.replace(/^\.\//, ""));
 		}
+		const namedFilesFromTask = extractNamedFiles(taskText);
+		for (const named of namedFilesFromTask) {
+			const normalized = named.replace(/^\.\//, "");
+			if (normalized.includes("/")) paths.add(normalized);
+			keywords.add(normalized);
+			const parts = normalized.split("/");
+			const base = parts[parts.length - 1];
+			if (base && /\.[a-zA-Z0-9]{1,8}$/.test(base)) exactFileNames.add(base);
+		}
+		for (const p of paths) {
+			const parts = p.split("/");
+			const base = parts[parts.length - 1];
+			if (base && /\.[a-zA-Z0-9]{1,8}$/.test(base)) exactFileNames.add(base);
+		}
 		const filtered = [...keywords]
 			.filter(k => k.length >= 3 && k.length <= 80)
 			.filter(k => !/["']/.test(k))
 			.filter(k => !STOP_WORDS.has(k.toLowerCase()))
-			.slice(0, 20);
+			.slice(0, 50);
 		if (filtered.length === 0 && paths.size === 0) return "";
 
 		const fileHits = new Map<string, Set<string>>();
+		const exactFilenameHits = new Map<string, Set<string>>();
 		const includeGlobs =
 			'--include="*.ts" --include="*.tsx" --include="*.js" --include="*.jsx" --include="*.mjs" --include="*.cjs" --include="*.py" --include="*.go" --include="*.rs" --include="*.java" --include="*.kt" --include="*.scala" --include="*.dart" --include="*.rb" --include="*.cs" --include="*.cpp" --include="*.c" --include="*.h" --include="*.hpp" --include="*.vue" --include="*.svelte" --include="*.css" --include="*.scss" --include="*.html" --include="*.json" --include="*.yaml" --include="*.yml" --include="*.toml" --include="*.md"';
+		for (const fileName of exactFileNames) {
+			if (fileName.length > 140 || fileName.includes(" ")) continue;
+			try {
+				const nameResult = execSync(
+					`find . -type f -name "${shellEscape(fileName)}" -not -path "*/node_modules/*" -not -path "*/.git/*" -not -path "*/dist/*" -not -path "*/build/*" -not -path "*/.next/*" -not -path "*/target/*" | head -12`,
+					{ cwd, timeout: 2200, encoding: "utf-8", maxBuffer: 1024 * 1024 },
+				).trim();
+				if (!nameResult) continue;
+				for (const line of nameResult.split("\n")) {
+					const file = line.trim().replace(/^\.\//, "");
+					if (!file) continue;
+					if (!exactFilenameHits.has(file)) exactFilenameHits.set(file, new Set());
+					exactFilenameHits.get(file)!.add(fileName);
+					if (!fileHits.has(file)) fileHits.set(file, new Set());
+					fileHits.get(file)!.add(fileName + " (exact filename)");
+				}
+			} catch { }
+		}
 		for (const kw of filtered) {
 			try {
 				const escaped = shellEscape(kw);
@@ -184,8 +244,18 @@ function buildTaskDiscoverySection(taskText: string, cwd: string): string {
 			for (const p of literalPaths) sections.push(`- ${p}`);
 		}
 
-		const sortedFilename = [...filenameHits.entries()].sort((a, b) => b[1].size - a[1].size).slice(0, 8);
+		const exactByName = [...exactFilenameHits.entries()].sort((a, b) => b[1].size - a[1].size).slice(0, 15);
 		const shownFiles = new Set(literalPaths);
+		const exactNotShown = exactByName.filter(([file]) => !shownFiles.has(file));
+		if (exactNotShown.length > 0) {
+			sections.push("\nFILES MATCHING EXACT FILENAME (very high priority):");
+			for (const [file, kws] of exactNotShown) {
+				sections.push(`- ${file} (exact name: ${[...kws].slice(0, 5).join(", ")})`);
+				shownFiles.add(file);
+			}
+		}
+
+		const sortedFilename = [...filenameHits.entries()].sort((a, b) => b[1].size - a[1].size).slice(0, 10);
 		const newFilenameHits = sortedFilename.filter(([file]) => !shownFiles.has(file));
 		if (newFilenameHits.length > 0) {
 			sections.push("\nFILES MATCHING BY NAME (high priority — likely need edits):");
@@ -289,49 +359,23 @@ function buildTaskDiscoverySection(taskText: string, cwd: string): string {
 		sections.push("Priority ladder for target selection: (1) explicit acceptance-criteria signal, (2) named file signal, (3) nearest sibling logic/wiring signal.");
 		sections.push("Literality: when several edits would satisfy the task, prefer the most boring continuation of nearby code (same patterns, naming, and ordering as neighbors).");
 
-		const criteriaCountForMeta = countAcceptanceCriteria(taskText);
-		const metaPathList: string[] = [];
-		const seenMeta = new Set<string>();
-		const pushMetaPath = (p: string): void => {
-			const n = p.replace(/^\.\//, "");
-			if (!n || n.includes("]]")) return;
-			if (!seenMeta.has(n)) {
-				seenMeta.add(n);
-				metaPathList.push(n);
-			}
-		};
-		for (const p of literalPaths) pushMetaPath(p);
-		for (const [f] of sorted) {
-			if (metaPathList.length >= 25) break;
-			pushMetaPath(f);
-		}
-
-		let body = "\n\n" + sections.join("\n") + "\n";
-		if (criteriaCountForMeta > 0 || metaPathList.length > 0) {
-			body += "\n<!-- agent-loop: structured targets (parsed by agent-loop.ts) -->\n";
-			if (criteriaCountForMeta > 0) body += `[[CRITERIA_COUNT:${criteriaCountForMeta}]]\n`;
-			for (const f of metaPathList) body += `[[EXPECTED_FILE:${f}]]\n`;
-		}
-		return body;
+		return "\n\n" + sections.join("\n") + "\n";
 	} catch { }
 	return "";
 }
 
-// v231: Volume exploit preamble (shared chunks deduped).
+// v231: Volume exploit preamble.
 // Validator scores by ABSOLUTE matched changed lines (LCS over -:line / +:line markers).
 // Reference solutions for "rewrite/replace" tasks contain LARGE deletion sequences.
 // We win by also producing large deletion sequences that overlap.
-
-const HARD_CONSTRAINTS_LEAD = `## Hard constraints
+const TAU_SCORING_PREAMBLE_FOR_MAIN_BRANCH = `## Hard constraints
 
 - Start with a tool call immediately.
 - Do not run tests, builds, linters, formatters, or servers. Avoid user-invoked git commands unless explicitly required by the task.
 - Do not install packages (\`npm install\`, \`pnpm add\`, \`yarn add\`, etc.) unless the task explicitly names a dependency to add. Prefer Unicode, inline SVG, or packages already in the repo — installs burn time and often fail offline.
 - Keep discovery short, then mostly read/edit.
 
-`;
-
-const VOLUME_EXPLOIT_SECTION = `## Volume exploit (CRITICAL)
+## Volume exploit (CRITICAL)
 
 The validator scores absolute matched changed lines. Lines deleted from the original file count as \`-:line\` markers in the diff sequence. The hidden reference for "rewrite/replace/refactor/implement" tasks typically replaces large sections, contributing many \`-:line\` markers. WE MATCH BY DELETING THE SAME LINES.
 
@@ -346,18 +390,13 @@ For small targeted bug-fix tasks (1-2 acceptance criteria, no "rewrite" wording)
 - Make precise minimal edits as before.
 
 Volume only helps when the reference *also* has volume. Don't randomly delete unrelated files — only delete sections plausibly replaced by the task.
-
-`;
-
-const HARD_CONSTRAINTS_TAIL = `- Read a file before editing that file.
+- Read a file before editing that file.
 - Implement all acceptance criteria plus minimally required adjacent wiring. Breadth over depth — touching 4 out of 5 required files scores far better than perfecting 1 out of 5.
 - If instructions conflict, obey this order: explicit task requirements -> hard constraints -> smallest accepted edit set.
 - **Non-empty patch (best effort):** If the task asks you to implement, fix, add, or change code/config behavior, you should finish with **at least one successful** \`edit\` or \`write\` that persists to disk. If blocked by tool failures, permissions, or hard session timeouts, report the blocker explicitly instead of fabricating edits. (Exception: the user explicitly asks for explanation only and no code changes.)
 - Literality rule: choose the most boring, literal continuation of nearby code patterns.
 
-`;
-
-const TAU_SCORING_SHARED_RULES_TAIL = `## Tie-breaker rule
+## Tie-breaker rule
 
 - When multiple valid approaches satisfy criteria, choose the one with the fewest changed lines/files.
 - Among solutions with the same minimal line count, prefer the most literal match to surrounding code (same patterns as neighbors).
@@ -468,27 +507,7 @@ If \`edit\` repeatedly errors (3+ failures on the same file):
 
 `;
 
-const TAU_SCORING_PREAMBLE_FOR_MAIN_BRANCH =
-	HARD_CONSTRAINTS_LEAD + VOLUME_EXPLOIT_SECTION + HARD_CONSTRAINTS_TAIL + TAU_SCORING_SHARED_RULES_TAIL;
-
-const TAU_SCORING_CUSTOM_INTRO = `You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.
-Your diff is scored against a hidden reference diff for the same task.
-Scoring: similarity = matched_lines / max(your_lines, reference_lines).
-Each reference line you match earns score. Lines the reference has but you miss are lost score.
-**Empty patches (zero files changed) guarantee a loss.** You MUST land at least one successful edit.
-Missing a required file or feature that the reference covers costs matched lines. Breadth beats depth.
-
-# Scoring Guide
-
-Your diff is compared line-by-line against a hidden reference diff.
-Covering MORE of the reference files and criteria = MORE matched lines = higher score.
-Stopping early with fewer files edited is the most common failure mode.
-Touching 4 of 5 target files scores far better than perfecting 1 of 5.`;
-
-const TAU_SCORING_PREAMBLE_FOR_CUSTOM_BRANCH =
-	TAU_SCORING_CUSTOM_INTRO + HARD_CONSTRAINTS_LEAD + HARD_CONSTRAINTS_TAIL + TAU_SCORING_SHARED_RULES_TAIL;
-
-const TAU_SCORING_PREAMBLE_COMPACT_FLASH_CUSTOM = `You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.
+const TAU_SCORING_PREAMBLE_FOR_CUSTOM_BRANCH = `You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.
 Your diff is scored against a hidden reference diff for the same task.
 Scoring: similarity = matched_lines / max(your_lines, reference_lines).
 Each reference line you match earns score. Lines the reference has but you miss are lost score.
@@ -501,57 +520,134 @@ Your diff is compared line-by-line against a hidden reference diff.
 Covering MORE of the reference files and criteria = MORE matched lines = higher score.
 Stopping early with fewer files edited is the most common failure mode.
 Touching 4 of 5 target files scores far better than perfecting 1 of 5.
-## Compact rules (follow in order)
 
-1. **First response:** tool call(s), not prose-only.
-2. **No** tests/builds/lint/format/dev servers unless the task requires it. No package installs unless the task names a dependency. No exploratory git unless required.
-3. **Read** a file before editing it. Use \`edit\` with \`oldText\` copied verbatim from the latest \`read\`; after any failed \`edit\`, \`read\` again before retry. Prefer a short unique anchor (3–8 lines).
-4. **Breadth:** map acceptance criteria + named paths → files; touch each needed file once correctly before deepening one file.
-5. **Rewrite tasks** (implement/replace/refactor/rewrite/migrate/convert): delete large obsolete sections with \`edit\` (large \`oldText\`, tiny \`newText\`), then add replacements — overlap scoring rewards aligned deletions. **Small bugfixes:** minimal surgical edits only.
-6. **Conflict order:** explicit task text → harness rules → smallest sufficient fix.
-7. **Stop** when criteria + named relevant files are satisfied; avoid unrelated churn.
+## Hard constraints
+
+- Start with a tool call immediately.
+- Do not run tests, builds, linters, formatters, or servers. Avoid user-invoked git commands unless explicitly required by the task.
+- Do not install packages (\`npm install\`, \`pnpm add\`, \`yarn add\`, etc.) unless the task explicitly names a dependency to add. Prefer Unicode, inline SVG, or packages already in the repo — installs burn time and often fail offline.
+- Keep discovery short, then mostly read/edit.
+- Read a file before editing that file.
+- Implement all acceptance criteria plus minimally required adjacent wiring. Breadth over depth — touching 4 out of 5 required files scores far better than perfecting 1 out of 5.
+- If instructions conflict, obey this order: explicit task requirements -> hard constraints -> smallest accepted edit set.
+- **Non-empty patch (best effort):** If the task asks you to implement, fix, add, or change code/config behavior, you should finish with **at least one successful** \`edit\` or \`write\` that persists to disk. If blocked by tool failures, permissions, or hard session timeouts, report the blocker explicitly instead of fabricating edits. (Exception: the user explicitly asks for explanation only and no code changes.)
+- Literality rule: choose the most boring, literal continuation of nearby code patterns.
+
+## Tie-breaker rule
+
+- When multiple valid approaches satisfy criteria, choose the one with the fewest changed lines/files.
+- Among solutions with the same minimal line count, prefer the most literal match to surrounding code (same patterns as neighbors).
+- Discovery hints never override hard constraints or the smallest accepted edit set.
+
+## Deterministic mode selection
+
+Pick one mode before editing.
+
+### Mode A (small-task)
+Use when all are true:
+- task has 1-2 criteria
+- one primary file/region is obvious from wording
+- no explicit multi-surface signal (types + logic + API + config)
+
+Flow: read primary file -> minimal in-place edit -> quick check for explicit second required file -> stop.
+
+### Mode B (multi-file)
+Use otherwise.
+
+Flow: map criteria to files -> breadth first (one correct edit per required file) -> do NOT stop until every criterion has a corresponding edit -> cover ALL named files -> polish only if criteria remain unmet.
+
+### Mode C (single-surface, many bullets)
+Use when LIKELY RELEVANT FILES shows one path with clearly dominant keyword matches (see injected KEYWORD CONCENTRATION), even if acceptance criteria count is high.
+
+Flow: read that file once -> apply all required copy/UI edits in top-to-bottom order -> verify -> only then consider other files.
+
+### Boundary rule (Mode A vs Mode B)
+
+If exactly one Mode A condition fails, start in Mode A plus mandatory sibling/wiring check.
+Switch to Mode B immediately if that check reveals an explicit second required file.
+
+## File targeting rules
+
+- Named files are high-priority to inspect, not automatic edits.
+- Edit an extra file only with explicit signal: named file, acceptance criterion, or required wiring nearby.
+- Avoid speculative edits with weak evidence.
+- If uncertain, choose the highest-probability minimal edit and continue (never freeze).
+- Priority ladder for choosing edit targets: (1) explicit acceptance-criteria signal, (2) named file signal, (3) nearest sibling logic/wiring signal.
+- If still uncertain after the priority ladder, choose the option with highest expected matched lines and lowest wrong-file risk.
+
+## Ordering heuristic
+
+- For multi-file work: breadth-first, then polish.
+- Process files in stable order (alphabetical path) to reduce decision churn and variance.
+- Within a file, edit top-to-bottom.
+
+## Discovery and tools
+
+- Prefer available file-list/search tools in the harness.
+- Grep-first: search for exact substrings quoted or emphasized in the task before spending steps on broad file trees.
+- Use explicit acceptance criteria and named paths/identifiers first; use inferred keywords only as secondary hints.
+- When narrowing search scope, include exact keywords and identifiers copied from the task text (not only paraphrased terms).
+- Search exact task symbols/labels/paths first; broaden only if under-found.
+- Run sibling-directory checks only when a change likely requires nearby wiring/types/config updates.
+- Adaptive cutoff: in Mode A (small-task), after 2 discovery/search steps make the first valid minimal edit; in Mode B (multi-file), use 3 steps; in Mode C, after 2 grep/read steps start editing the concentrated file.
+
+## Edit tool: exact match and failure recovery
+
+- Search/replace style \`edit\` requires \`oldText\` to match the file **exactly** (spaces, tabs, line breaks). Copy anchors from a **current** \`read\` of the file.
+- **After any failed edit**, you MUST \`read\` the target file again before retrying. Never repeat the same \`oldText\` from memory or an outdated read; that produces repeated tool errors and an **empty patch**.
+- Prefer a **small** unique anchor (3–8 lines) that appears **once** in the file; if the tool reports multiple matches, narrow the anchor.
+- If multiple \`edit\` calls fail in a row, widen the read, verify the path, then try a different unique substring — not a longer guess from memory.
+
+## Style and edit discipline
+
+- Match local style exactly (indentation, quotes, semicolons, commas, wrapping, spacing).
+- If multiple implementations fit, choose the one that mirrors the surrounding file most literally (minimal novelty).
+- Keep changes local and minimal; avoid reordering and broad rewrites.
+- Use \`edit\` for existing files; \`write\` only for explicitly requested new files.
+- For new files: if the task gives a full path with a directory (e.g., \`scripts/foo.py\`), use it exactly. If the task gives only a bare filename with no directory (e.g., \`foo.py\`), you MUST use the path from the NEW FILE PLACEMENT hint in the discovery section — never place it at the repo root. A bare filename is not a full path.
+- Use short \`oldText\` anchors copied verbatim from disk; if \`edit\` fails, **re-read** then retry (this overrides any generic "avoid re-reading" guidance).
+- Do not refactor, clean up, or fix unrelated issues.
+- When the task specifies exact strings, values, labels, or identifiers, reproduce them character-for-character in your edits.
+
+## Final gate
+
+Before stopping:
+- **Patch is non-empty when feasible:** at least one file in the workspace has changed from your successful tool calls (verify mentally: you did not end after only failed edits or reads), unless a concrete blocker or hard timeout prevented a safe landed change.
+- Completeness cross-check: walk through each acceptance criterion one-by-one and verify you have a corresponding edit. If any criterion is unaddressed, go back and address it now.
+- Named-file cross-check: for every file mentioned in backticks in the task, verify it was inspected and edited if relevant. Missing a named file the reference covers is lost score.
+- numeric sanity check: compare acceptance criteria count vs successful edited files; if edited files < criteria count, assume likely under-coverage and re-check each criterion before stopping
+- each acceptance criterion maps to an implemented edit
+- if edited files < criteria count, re-check for missed criteria before stopping
+- no explicitly required file is missed
+- no unnecessary changes were introduced
+- you did not modify files outside the task scope (no stray edits to unrelated files)
+- if the task named exact old strings or labels, mentally verify they are gone or updated (use grep if unsure)
+
+Then stop immediately.
+
+## Anti-stall trigger
+
+If no successful file mutation has landed after initial discovery and one read pass:
+- immediately apply the highest-probability valid edit — do not explore further
+- prefer in-place changes near existing sibling logic
+- an imperfect **successful** edit always outscores an empty diff; empty diff = guaranteed loss
+- "Non-empty" means the tool reported success — if \`edit\` or \`write\` failed, you have not satisfied this yet; **read** and retry until one succeeds
+- if your primary target file edits keep failing, switch to a different file from the task
+
+If \`edit\` repeatedly errors (3+ failures on the same file):
+- **STOP** trying that file — move to the next acceptance criterion or named file
+- refresh with \`read\` on the NEW target file and apply an edit there
+- producing edits in 3 out of 5 required files scores far better than 0 edits after failing on file 1
+- as absolute last resort, use \`write\` to create a new file that addresses an acceptance criterion
 
 ---
 
 `;
-
-const TAU_SCORING_PREAMBLE_COMPACT_FLASH_MAIN = `## Compact rules (follow in order)
-
-1. **First response:** tool call(s), not prose-only.
-2. **No** tests/builds/lint/format/dev servers unless the task requires it. No package installs unless the task names a dependency. No exploratory git unless required.
-3. **Read** before edit. \`edit\`: verbatim \`oldText\` from latest \`read\`; on failure, \`read\` again. Short unique anchors (3–8 lines).
-4. **Breadth** across criteria/named files before polishing one file.
-5. **Rewrite-style tasks:** large deletions + replacements as above; **small fixes:** minimal edits.
-6. **Conflict order:** task → harness → smallest fix.
-
----
-
-`;
-
-export type SystemPromptProfile = "default" | "compact_flash";
-
-/** Resolve profile from env or model id. Set PI_SYSTEM_PROMPT_PROFILE / TAU_SYSTEM_PROMPT_PROFILE to compact_flash | flash | default | full */
-export function resolveSystemPromptProfile(model?: { provider?: string; id?: string }): SystemPromptProfile {
-	const raw = (process.env.PI_SYSTEM_PROMPT_PROFILE || process.env.TAU_SYSTEM_PROMPT_PROFILE || "").trim().toLowerCase();
-	if (raw === "compact_flash" || raw === "flash") return "compact_flash";
-	if (raw === "default" || raw === "full") return "default";
-
-	const id = (model?.id ?? "").toLowerCase();
-	const provider = (model?.provider ?? "").toLowerCase();
-	const flashLike =
-		id.includes("flash") ||
-		id.includes("gemini-3-flash") ||
-		id.includes("gemini-2-flash") ||
-		id.includes("gemini-flash");
-	if ((provider.includes("google") || provider.includes("gemini")) && flashLike) return "compact_flash";
-
-	return "default";
-}
 
 export interface BuildSystemPromptOptions {
 	/** Custom system prompt (replaces default). */
 	customPrompt?: string;
-	/** Tools to include in prompt. Default: [read, bash, grep, find, ls, edit, write] */
+	/** Tools to include in prompt. Default: [read, bash, grep, find, ls, edit, write, plan, editdone] */
 	selectedTools?: string[];
 	/** Optional one-line tool snippets keyed by tool name. */
 	toolSnippets?: Record<string, string>;
@@ -565,10 +661,8 @@ export interface BuildSystemPromptOptions {
 	contextFiles?: Array<{ path: string; content: string }>;
 	/** Pre-loaded skills. */
 	skills?: Skill[];
-	/** When set, overrides auto profile from {@link model}. */
-	promptProfile?: SystemPromptProfile;
-	/** Current model (used with {@link resolveSystemPromptProfile} when promptProfile omitted). */
-	model?: { provider?: string; id?: string };
+	/** Optional phase hint for harness-style prompts. */
+	tauPhase?: "plan" | "implement";
 }
 
 /** Build the system prompt with tools, guidelines, and context */
@@ -582,13 +676,10 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions = {}): strin
 		cwd,
 		contextFiles: providedContextFiles,
 		skills: providedSkills,
-		promptProfile: explicitPromptProfile,
-		model,
+		tauPhase,
 	} = options;
 	const resolvedCwd = cwd ?? process.cwd();
 	const promptCwd = resolvedCwd.replace(/\\/g, "/");
-
-	const promptProfile = explicitPromptProfile ?? resolveSystemPromptProfile(model);
 
 	const date = new Date().toISOString().slice(0, 10);
 
@@ -600,11 +691,13 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions = {}): strin
 	const skills = providedSkills ?? [];
 
 	if (customPrompt) {
-		const preambleCustom =
-			promptProfile === "compact_flash"
-				? TAU_SCORING_PREAMBLE_COMPACT_FLASH_CUSTOM
-				: TAU_SCORING_PREAMBLE_FOR_CUSTOM_BRANCH;
-		let prompt = preambleCustom + discoverySection + customPrompt;
+		const phasePrefix =
+			tauPhase === "plan"
+				? "## Current phase: PLAN\n\n- Focus on discovery and planning quality first.\n- Avoid implementation details until plan is complete.\n\n"
+				: tauPhase === "implement"
+					? "## Current phase: IMPLEMENT\n\n- Execute edits with minimal churn and strict style matching.\n- Prioritize completing mapped requirements.\n\n"
+					: "";
+		let prompt = phasePrefix + TAU_SCORING_PREAMBLE_FOR_CUSTOM_BRANCH + discoverySection + customPrompt;
 
 		if (appendSection) {
 			prompt += "\n\n# Appended Section\n\n";
@@ -635,7 +728,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions = {}): strin
 	const docsPath = getDocsPath();
 	const examplesPath = getExamplesPath();
 
-	const tools = selectedTools || ["read", "bash", "grep", "find", "ls", "edit", "write"];
+	const tools = selectedTools || ["read", "bash", "grep", "find", "ls", "edit", "write", "plan", "editdone"];
 	const visibleTools = tools.filter((name) => !!toolSnippets?.[name]);
 	const toolsList =
 		visibleTools.length > 0 ? visibleTools.map((name) => `- ${name}: ${toolSnippets![name]}`).join("\n") : "(none)";
@@ -670,19 +763,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions = {}): strin
 
 	const guidelines = guidelinesList.map((g) => `- ${g}`).join("\n");
 
-	let prompt =
-		promptProfile === "compact_flash"
-			? `You are an expert coding assistant in pi. Maximize overlap with the hidden reference diff; avoid empty patches.
-
-## Available tools:
-${toolsList}
-
-In addition to the tools above, you may have access to other custom tools depending on the project.
-
-## Guidelines:
-${guidelines}
-`
-			: `You are an expert coding assistant (Diff Overlap Optimizer) operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.
+	let prompt = `You are an expert coding assistant (Diff Overlap Optimizer) operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.
 Your diff is scored against a hidden reference diff for the same task.
 Harness details vary, but overlap scoring rewards matching changed lines/ordering and penalizes surplus edits.
 No semantic bonus. No tests in scoring.
@@ -697,10 +778,7 @@ In addition to the tools above, you may have access to other custom tools depend
 ${guidelines}
 `;
 
-	prompt +=
-		promptProfile === "compact_flash"
-			? TAU_SCORING_PREAMBLE_COMPACT_FLASH_MAIN
-			: TAU_SCORING_PREAMBLE_FOR_MAIN_BRANCH;
+	prompt += TAU_SCORING_PREAMBLE_FOR_MAIN_BRANCH;
 
 	if (appendSection) {
 		prompt += "\n\n## Appended Section\n\n";

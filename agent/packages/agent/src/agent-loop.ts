@@ -273,53 +273,9 @@ async function runLoop(
 		return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
 	};
 
-	// Machine-readable markers from system-prompt discovery (preferred over regex on prose headings)
-	const parseExpectedFilesFromMeta = (text: string): string[] => {
-		const files: string[] = [];
-		const seen = new Set<string>();
-		const re = /\[\[EXPECTED_FILE:([^\]\n]+)\]\]/g;
-		let m: RegExpExecArray | null;
-		while ((m = re.exec(text)) !== null) {
-			const file = m[1].trim();
-			if (file && !seen.has(file) && isRealUnixFile(file)) {
-				seen.add(file);
-				files.push(file);
-			}
-		}
-		return files;
-	};
-
-	const parseCriteriaCountFromMeta = (text: string): number => {
-		const matches = [...text.matchAll(/\[\[CRITERIA_COUNT:(\d+)\]\]/g)];
-		if (matches.length === 0) return 0;
-		const last = matches[matches.length - 1]?.[1];
-		const parsed = last ? Number.parseInt(last, 10) : NaN;
-		return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
-	};
-
 	// Extract expected files from system prompt or initial messages
 	const systemPromptText = (currentContext as any).systemPrompt || "";
-
-	const collectPromptAndMessageText = (): string => {
-		let blob = systemPromptText;
-		for (const msg of currentContext.messages) {
-			if (!("content" in msg) || !Array.isArray(msg.content)) continue;
-			for (const block of msg.content as any[]) {
-				if (block?.type === "text" && typeof block.text === "string") blob += "\n" + block.text;
-			}
-		}
-		return blob;
-	};
-
-	let metaFiles = parseExpectedFilesFromMeta(systemPromptText);
-	let metaCriteria = parseCriteriaCountFromMeta(systemPromptText);
-	if (metaFiles.length === 0 && metaCriteria === 0) {
-		const blob = collectPromptAndMessageText();
-		metaFiles = parseExpectedFilesFromMeta(blob);
-		metaCriteria = parseCriteriaCountFromMeta(blob);
-	}
-
-	let expectedFiles: string[] = metaFiles.length > 0 ? metaFiles : parseExpectedFiles(systemPromptText);
+	let expectedFiles: string[] = parseExpectedFiles(systemPromptText);
 	if (expectedFiles.length === 0) {
 		for (const msg of currentContext.messages) {
 			if (!("content" in msg) || !Array.isArray(msg.content)) continue;
@@ -334,7 +290,7 @@ async function runLoop(
 	}
 
 	// Extract expected acceptance criteria count from system prompt or initial messages
-	let expectedCriteriaCount = metaCriteria > 0 ? metaCriteria : parseExpectedCriteriaCount(systemPromptText);
+	let expectedCriteriaCount = parseExpectedCriteriaCount(systemPromptText);
 	if (expectedCriteriaCount === 0) {
 		for (const msg of currentContext.messages) {
 			if (!("content" in msg) || !Array.isArray(msg.content)) continue;
@@ -791,20 +747,10 @@ async function runLoop(
 			}
 
 			const toolCalls = message.content.filter((c) => c.type === "toolCall");
-			const CANON_TOOL_NAME_BY_LOWER: Record<string, string> = {
-				editedits: "edit",
-				edit_edits: "edit",
-				apply_patch: "edit",
-				applypatch: "edit",
-				write_file: "write",
-				writefile: "write",
-				read_file: "read",
-				readfile: "read",
-			};
+			// Gemini sometimes hallucinates "EditEdits" or "editEdits" instead of "edit"
 			for (const tc of toolCalls) {
-				const canon = CANON_TOOL_NAME_BY_LOWER[tc.name.toLowerCase()];
-				if (canon && canon !== tc.name) {
-					(tc as { name: string }).name = canon;
+				if (tc.name === "EditEdits" || tc.name === "editEdits") {
+					(tc as { name: string }).name = "edit";
 				}
 			}
 			hasMoreToolCalls = toolCalls.length > 0;
