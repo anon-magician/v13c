@@ -16,7 +16,7 @@ export interface TaskStyleResult {
 
 function resolveTaskStyleMode(): TaskStyleMode {
 	const rawMode = process.env[TASK_STYLE_ENV]?.trim().toLowerCase();
-	if (rawMode === "between-lines" || rawMode === "1" || rawMode === "true" || rawMode === "yes") {
+	if (!rawMode || rawMode === "between-lines" || rawMode === "1" || rawMode === "true" || rawMode === "yes") {
 		return "between-lines";
 	}
 	return "off";

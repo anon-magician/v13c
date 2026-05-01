@@ -24,21 +24,6 @@ import type {
 
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
 
-type TauPhase = "plan" | "implement";
-
-function buildRuntimePhaseSystemPrompt(basePrompt: string, phase: TauPhase): string {
-	const looksLikeTauPrompt =
-		/hidden reference diff|diff overlap optimizer|scoring guide|coding agent harness/i.test(basePrompt);
-	if (!looksLikeTauPrompt) {
-		return basePrompt;
-	}
-	const phaseHeader =
-		phase === "plan"
-			? "## Current phase: PLAN (runtime enforced)\n- Do discovery/planning first and map criteria to files.\n- Keep implementation details scoped until targets are clear."
-			: "## Current phase: IMPLEMENT (runtime enforced)\n- Execute planned edits with minimal churn.\n- Ensure each acceptance criterion maps to landed edits.";
-	return `${basePrompt}\n\n${phaseHeader}`;
-}
-
 /**
  * Start an agent loop with a new prompt message.
  * The prompt is added to the context and events are emitted for it.
@@ -379,14 +364,12 @@ async function runLoop(
 	}, HARD_ABORT_MS);
 	if (typeof (_watchdogTimer as any).unref === "function") (_watchdogTimer as any).unref();
 	let reviewPassDone = false;
-	let tauPhase: TauPhase = "plan";
 
 	/** Successful `edit` or `write` mutates disk — both must advance scoring-related loop state (was edit-only). */
 	const recordSuccessfulFileMutation = async (targetPath: string): Promise<void> => {
 		editFailMap.set(targetPath, 0);
 		priorFailedAnchor.delete(targetPath);
 		hasProducedEdit = true;
-		tauPhase = "implement";
 		explorationCount = 0;
 		const normTarget = normalizePath(targetPath);
 		editedPaths.add(normTarget);
@@ -732,7 +715,7 @@ async function runLoop(
 			}
 
 			// Stream assistant response
-			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn, tauPhase);
+			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
 			newMessages.push(message);
 
 			if (message.stopReason === "aborted") {
@@ -1393,7 +1376,6 @@ async function streamAssistantResponse(
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 	streamFn?: StreamFn,
-	tauPhase: TauPhase = "plan",
 ): Promise<AssistantMessage> {
 	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
 	let messages = context.messages;
@@ -1405,9 +1387,8 @@ async function streamAssistantResponse(
 	const llmMessages = await config.convertToLlm(messages);
 
 	// Build LLM context
-	const runtimeSystemPrompt = buildRuntimePhaseSystemPrompt(context.systemPrompt, tauPhase);
 	const llmContext: Context = {
-		systemPrompt: runtimeSystemPrompt,
+		systemPrompt: context.systemPrompt,
 		messages: llmMessages,
 		tools: context.tools,
 	};
